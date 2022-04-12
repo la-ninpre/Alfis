@@ -81,6 +81,26 @@ emerge net-dns/alfis
 ### ![NixOS Logo](https://nixos.org/favicon.ico) On Nix/NixOS
 `nix-shell` in this repo and then run `cargo build --release` and `cargo install` after you have entered the shell.
 
+### On BSDs
+
+Because there is no complete ports, you have to clone this repo and
+run `cargo build --release` in it. Please note that for GUI support you need
+`libwebkitgtk`. Refer to your OS's documentation and ports collection for
+corresponding package name.
+
+GUI is not currently supported on NetBSD and DragonflyBSD.
+
+#### On OpenBSD
+
+Building ALFIS is only supported on OpenBSD-7.1-beta (or -current) as for now.
+When OpenBSD 7.1 will come out, this should not be an issue.
+
+For GUI you need to have `webkitgtk4` package.
+
+```sh
+doas pkg_add webkitgtk4
+```
+
 ## Installation
 
 ### Debian/Ubuntu (only blockchain DNS, without GUI)
@@ -121,6 +141,13 @@ It needs to be without `nogui` suffix.
 Just unzip that archive in some directory and run `alfis` (or `alfis.exe`) binary.
 By default, it searches for config file, named `alfis.toml` in current working directory, and creates/changes `blockchain.db` file in the same directory.
 If you want it to load config from another file you can command it so: `alfis -c /etc/alfis.conf`.
+
+### OpenBSD
+For quick testing you can run ALFIS in a tmux(1) session, but a better way
+would be creating a dedicated unprivileged user just for this service.
+Also note that if you want ALFIS to listen on a port lower than 1024,
+you have to run it as root. Currently ALFIS makes no use of OpenBSD's security
+measures such as pledge(4) and unveil(4). It is planned to add support for them.
 
 ## Roadmap
 1. Stabilize blockchain functions (domain transfer, info & contacts in UI), bug hunting and fixing.
