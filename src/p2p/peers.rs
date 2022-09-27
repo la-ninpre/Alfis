@@ -9,6 +9,7 @@ use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 use mio::net::TcpStream;
 use mio::{Interest, Registry, Token};
+use rand::prelude::SliceRandom;
 use rand::random;
 use rand::seq::IteratorRandom;
 
@@ -194,6 +195,10 @@ impl Peers {
         for (_, peer) in self.peers.iter() {
             if peer.active() {
                 count += 1;
+            } else {
+                if !matches!(peer.get_state(), State::Connecting) {
+                    trace!("Inactive peer from {:?} in state: {:?}", peer.get_addr(), peer.get_state());
+                }
             }
         }
         count
@@ -227,7 +232,6 @@ impl Peers {
             None => {}
             Some(t) => {
                 self.close_peer(registry, &t);
-                self.peers.remove(&t);
             }
         }
     }
@@ -250,6 +254,7 @@ impl Peers {
         let nodes = self.get_peers_active_count();
 
         let random_time = random::<u64>() % PING_PERIOD;
+        let mut stale_tokens = Vec::new();
         for (token, peer) in self.peers.iter_mut() {
             if let State::Idle { from } = peer.get_state() {
                 if from.elapsed().as_secs() >= PING_PERIOD + random_time {
@@ -262,15 +267,29 @@ impl Peers {
 
                     peer.set_state(State::message(message));
                     let stream = peer.get_stream();
+                    registry.reregister(stream, *token, Interest::WRITABLE | Interest::READABLE).unwrap();
+                }
+            } else {
+                if matches!(peer.get_state(), State::Message {..}) {
+                    if !peer.active() {
+                        stale_tokens.push((token.clone(), peer.get_addr()));
+                        continue;
+                    }
+                    let stream = peer.get_stream();
                     registry.reregister(stream, *token, Interest::WRITABLE).unwrap();
                 }
             }
         }
+        for (token, addr) in &stale_tokens {
+            info!("Closing stale peer from {}", addr);
+            self.close_peer(registry, token);
+        }
 
         // Just purging ignored/banned IPs every 10 minutes
-        // TODO make it individual
+        // TODO make it individual for every IP
         if self.ignore_timer.elapsed().as_secs() >= 600 {
             self.ignored.clear();
+            self.ignore_timer = Instant::now();
         }
 
         // If someone has more blocks we sync
@@ -284,13 +303,14 @@ impl Peers {
             let mut rng = rand::thread_rng();
             match self.peers
                 .iter_mut()
-                .filter_map(|(token, peer)| if peer.is_lower(height) && peer.get_state().is_idle() { Some((token, peer)) } else { None })
+                .filter_map(|(token, peer)| if peer.is_lower(height) && peer.get_state().is_idle() && peer.get_sent_height() < height { Some((token, peer)) } else { None })
                 .choose(&mut rng) {
                 None => {}
                 Some((token, peer)) => {
-                    debug!("Peer {} is behind, sending ping", &peer.get_addr().ip());
+                    debug!("Peer {} is behind ({}), sending ping", &peer.get_addr().ip(), peer.get_height());
                     registry.reregister(peer.get_stream(), *token, Interest::WRITABLE).unwrap();
                     peer.set_state(State::message(Message::Ping { height, hash }));
+                    peer.set_sent_height(height);
                     self.update_behind_ping_time();
                 }
             }
@@ -335,7 +355,7 @@ impl Peers {
             None => {}
             Some((token, peer)) => {
                 debug!("Peer {} is higher than we are, requesting block {}", &peer.get_addr().ip(), height + 1);
-                registry.reregister(peer.get_stream(), *token, Interest::WRITABLE).unwrap();
+                registry.reregister(peer.get_stream(), *token, Interest::WRITABLE | Interest::READABLE).unwrap();
                 peer.set_state(State::message(Message::GetBlock { index: height + 1 }));
             }
         }
@@ -343,10 +363,11 @@ impl Peers {
 
     fn ask_blocks_from_peers(&mut self, registry: &Registry, height: u64, max_height: u64, have_blocks: HashSet<u64>) {
         let mut rng = rand::thread_rng();
-        let peers = self.peers
+        let mut peers = self.peers
             .iter_mut()
             .filter_map(|(token, peer)| if peer.has_more_blocks(height) { Some((token, peer)) } else { None })
             .choose_multiple(&mut rng, (max_height - height) as usize);
+        peers.shuffle(&mut rng);
         let mut index = height + 1;
         for (token, peer) in peers {
             if have_blocks.contains(&index) {
@@ -368,6 +389,7 @@ impl Peers {
         if self.new_peers.is_empty() {
             return;
         }
+        self.new_peers.sort();
         self.new_peers.dedup();
         let addr = self.new_peers.remove(0);
         match self.connect_peer(&addr, registry, unique_token, yggdrasil_only) {

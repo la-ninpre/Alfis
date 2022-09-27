@@ -25,7 +25,7 @@ use crate::commons::*;
 use crate::crypto::Chacha;
 use crate::eventbus::{post, register};
 use crate::p2p::{Message, Peer, Peers, State};
-use crate::{Block, Context};
+use crate::{Block, Bytes, Context};
 
 const SERVER: Token = Token(0);
 
@@ -82,6 +82,7 @@ impl Network {
         let mut old_keys = 0i64;
         let mut old_nodes = 0usize;
         let mut old_banned = 0usize;
+        let mut seen_blocks = HashSet::new();
         loop {
             if self.peers.get_peers_count() == 0 && bootstrap_timer.elapsed().as_secs() > 60 {
                 warn!("Restarting swarm connections...");
@@ -118,6 +119,10 @@ impl Network {
 
                             if self.peers.is_ignored(&address.ip()) {
                                 debug!("Ignoring connection from banned {:?}", &address.ip());
+                                stream.shutdown(Shutdown::Both).unwrap_or_else(|e| {
+                                    warn!("Error in shutdown, {}", e);
+                                });
+                                let _ = poll.registry().reregister(&mut server, SERVER, Interest::READABLE);
                                 continue;
                             }
 
@@ -141,7 +146,7 @@ impl Network {
                         }
                     }
                     token => {
-                        if !self.handle_connection_event(poll.registry(), event) {
+                        if !self.handle_connection_event(poll.registry(), event, &mut seen_blocks) {
                             let _ = self.peers.close_peer(poll.registry(), &token);
                             let blocks = self.context.lock().unwrap().chain.get_height();
                             let keys = self.context.lock().unwrap().chain.get_users_count();
@@ -174,8 +179,13 @@ impl Network {
 
                     let keys = context.chain.get_users_count();
                     let domains = context.chain.get_domains_count();
-                    if old_nodes != nodes || old_blocks != blocks || old_banned != banned || old_domains != domains || old_keys != keys {
-                        info!("Active nodes: {}, banned: {}, blocks: {}, domains: {}, keys: {}", nodes, banned, blocks, domains, keys);
+                    let nodes_changed = old_nodes != nodes;
+                    let other_changed = old_blocks != blocks || old_banned != banned || old_domains != domains || old_keys != keys;
+                    if nodes_changed || other_changed {
+                        // Don't log every current connection count change
+                        if log_timer.elapsed().as_secs() > LOG_REFRESH_DELAY_SEC || other_changed {
+                            info!("Active nodes: {}, banned: {}, blocks: {}, domains: {}, keys: {}", nodes, banned, blocks, domains, keys);
+                        }
                         post(crate::event::Event::NetworkStatus { blocks, domains, keys, nodes });
                         old_nodes = nodes;
                         old_blocks = blocks;
@@ -190,6 +200,7 @@ impl Network {
                             warn!("Last network events time {} seconds ago", elapsed);
                         }
                         log_timer = Instant::now();
+                        seen_blocks.clear();
                     }
                     if nodes < MAX_NODES && connect_timer.elapsed().as_secs() >= 5 {
                         self.peers.connect_new_peers(poll.registry(), &mut self.token, yggdrasil_only);
@@ -210,23 +221,27 @@ impl Network {
         }
     }
 
-    fn handle_connection_event(&mut self, registry: &Registry, event: &Event) -> bool {
+    fn handle_connection_event(&mut self, registry: &Registry, event: &Event, seen_blocks: &mut HashSet<Bytes>) -> bool {
         if event.is_error() || (event.is_read_closed() && event.is_write_closed()) {
             return false;
         }
 
         if event.is_readable() {
-            return self.process_readable(registry, event);
+            if !self.process_readable(registry, event, seen_blocks) {
+                return false;
+            }
         }
 
         if event.is_writable() {
-            return self.process_writable(registry, event);
+            if !self.process_writable(registry, event) {
+                return false;
+            }
         }
 
         true
     }
 
-    fn process_readable(&mut self, registry: &Registry, event: &Event) -> bool {
+    fn process_readable(&mut self, registry: &Registry, event: &Event, seen_blocks: &mut HashSet<Bytes>) -> bool {
         let data = {
             let token = event.token();
             match self.peers.get_mut_peer(&token) {
@@ -239,7 +254,7 @@ impl Network {
                         debug!("Node from {} disconnected", peer.get_addr().ip());
                         return false;
                     }
-                    match peer.get_state().clone() {
+                    match *peer.get_state() {
                         State::Connected => {
                             let stream = peer.get_stream();
                             return match read_client_handshake(stream) {
@@ -319,12 +334,12 @@ impl Network {
             match Message::from_bytes(data) {
                 Ok(message) => {
                     //let m = format!("{:?}", &message);
-                    let new_state = self.handle_message(message, &event.token());
+                    let new_state = self.handle_message(message, &event.token(), seen_blocks);
                     let peer = self.peers.get_mut_peer(&event.token()).unwrap();
                     //debug!("Got message from {}: {:?}", &peer.get_addr(), &m);
-                    let stream = peer.get_stream();
                     match new_state {
                         State::Message { data } => {
+                            let stream = peer.get_stream();
                             registry.reregister(stream, event.token(), Interest::WRITABLE).unwrap();
                             peer.set_state(State::Message { data });
                         }
@@ -347,7 +362,8 @@ impl Network {
                             self.peers.ignore_peer(registry, &event.token());
                         }
                         State::SendLoop => {
-                            registry.reregister(stream, event.token(), Interest::WRITABLE).unwrap();
+                            let stream = peer.get_stream();
+                            registry.reregister(stream, event.token(), Interest::WRITABLE | Interest::READABLE).unwrap();
                             peer.set_state(State::SendLoop);
                         }
                         State::Twin => {
@@ -401,6 +417,7 @@ impl Network {
                         encode_message(&message, peer.get_cipher()).unwrap()
                     };
                     send_message(peer.get_stream(), &data).unwrap_or_else(|e| warn!("Error sending hello {}", e));
+                    peer.set_state(State::idle());
                     //debug!("Sent hello to {}", &peer.get_addr());
                 }
                 State::Connected => {}
@@ -409,6 +426,7 @@ impl Network {
                     if let Ok(data) = encode_bytes(&data, peer.get_cipher()) {
                         send_message(peer.get_stream(), &data).unwrap_or_else(|e| warn!("Error sending message {}", e));
                     }
+                    peer.set_state(State::idle());
                 }
                 State::Idle { from } => {
                     debug!("Odd version of pings :)");
@@ -428,10 +446,12 @@ impl Network {
                 State::SendLoop => {
                     let data = encode_message(&Message::Loop, peer.get_cipher()).unwrap();
                     send_message(peer.get_stream(), &data).unwrap_or_else(|e| warn!("Error sending loop {}", e));
+                    peer.set_state(State::idle());
                 }
                 State::Twin => {
                     let data = encode_message(&Message::Twin, peer.get_cipher()).unwrap();
                     send_message(peer.get_stream(), &data).unwrap_or_else(|e| warn!("Error sending loop {}", e));
+                    peer.set_state(State::idle());
                 }
             }
             registry.reregister(peer.get_stream(), event.token(), Interest::READABLE).unwrap();
@@ -439,7 +459,7 @@ impl Network {
         true
     }
 
-    fn handle_message(&mut self, message: Message, token: &Token) -> State {
+    fn handle_message(&mut self, message: Message, token: &Token, seen_blocks: &mut HashSet<Bytes>) -> State {
         let (my_height, my_hash, my_origin, my_version, me_public) = {
             let context = self.context.lock().unwrap();
             // TODO cache it somewhere
@@ -448,6 +468,10 @@ impl Network {
         let my_id = self.peers.get_my_id().to_owned();
         let answer = match message {
             Message::Hand { app_version, origin, version, public, rand_id } => {
+                if !version_compatible(&app_version) {
+                    info!("Banning peer with version {}", &app_version);
+                    return State::Banned;
+                }
                 if self.peers.is_our_own_connect(&rand_id) {
                     warn!("Detected loop connect");
                     State::SendLoop
@@ -479,6 +503,10 @@ impl Network {
                 if self.peers.is_tween_connect(&rand_id) {
                     return State::Twin;
                 }
+                if !version_compatible(&app_version) {
+                    info!("Banning peer with version {}", &app_version);
+                    return State::Banned;
+                }
                 let nodes = self.peers.get_peers_active_count();
                 let peer = self.peers.get_mut_peer(token).unwrap();
                 // TODO check rand_id whether we have this peers connection already
@@ -505,6 +533,9 @@ impl Network {
                 let peer = self.peers.get_mut_peer(token).unwrap();
                 peer.set_height(height);
                 peer.set_active(true);
+                if seen_blocks.contains(&hash) {
+                    return State::message(Message::pong(my_height, my_hash));
+                }
                 if peer.is_higher(my_height) {
                     let mut context = self.context.lock().unwrap();
                     context.chain.update_max_height(height);
@@ -523,6 +554,9 @@ impl Network {
                 let peer = self.peers.get_mut_peer(token).unwrap();
                 peer.set_height(height);
                 peer.set_active(true);
+                if seen_blocks.contains(&hash) {
+                    return State::idle();
+                }
                 if peer.is_higher(my_height) {
                     let mut context = self.context.lock().unwrap();
                     context.chain.update_max_height(height);
@@ -575,8 +609,12 @@ impl Network {
                 if index != block.index {
                     return State::Banned;
                 }
-                info!("Received block {} with hash {:?}", block.index, &block.hash);
-                self.handle_block(token, block)
+                debug!("Received block {} with hash {:?}", block.index, &block.hash);
+                if !seen_blocks.contains(&block.hash) {
+                    self.handle_block(token, block, seen_blocks)
+                } else {
+                    State::idle()
+                }
             }
             Message::Twin => State::Twin,
             Message::Loop => State::Loop
@@ -584,10 +622,12 @@ impl Network {
         answer
     }
 
-    fn handle_block(&mut self, token: &Token, block: Block) -> State {
+    fn handle_block(&mut self, token: &Token, block: Block, seen_blocks: &mut HashSet<Bytes>) -> State {
+        seen_blocks.insert(block.hash.clone());
         let peers_count = self.peers.get_peers_active_count();
         let peer = self.peers.get_mut_peer(token).unwrap();
         peer.set_received_block(block.index);
+        trace!("New block from {}", &peer.get_addr());
 
         let mut context = self.context.lock().unwrap();
         let max_height = context.chain.get_max_height();
@@ -632,8 +672,8 @@ impl Network {
                 if height + 1 == block.index {
                     context.chain.update_max_height(height);
                     post(crate::event::Event::SyncFinished);
-                    return State::Banned;
                 }
+                return State::Banned;
             }
             BlockQuality::Rewind => {
                 debug!("Got some orphan block, requesting its parent");
@@ -643,16 +683,14 @@ impl Network {
                 debug!("Got forked block {} with hash {:?}", block.index, block.hash);
                 // If we are very much behind of blockchain
                 let lagged = block.index == context.chain.get_height() && block.index + LIMITED_CONFIDENCE_DEPTH <= max_height;
-                let last_block = context.chain.last_block().unwrap();
-                if block.is_better_than(&last_block) || lagged {
+                let our_block = context.chain.get_block(block.index).unwrap();
+                if block.is_better_than(&our_block) || lagged {
                     context.chain.replace_block(block).expect("Error replacing block with fork");
                     let index = context.chain.get_height();
                     post(crate::event::Event::BlockchainChanged { index });
                 } else {
                     debug!("Fork in not better than our block, dropping.");
-                    if let Some(block) = context.chain.get_block(block.index) {
-                        return State::message(Message::block(block.index, block.as_bytes()));
-                    }
+                    return State::message(Message::block(our_block.index, our_block.as_bytes()));
                 }
             }
         }
@@ -886,4 +924,11 @@ fn would_block(err: &io::Error) -> bool {
 
 fn interrupted(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Interrupted
+}
+
+fn version_compatible(version: &str) -> bool {
+    let my_version = env!("CARGO_PKG_VERSION");
+    let parts = my_version.split('.').collect::<Vec<&str>>();
+    let major = format!("{}.{}", parts[0], parts[1]);
+    version.starts_with(&major)
 }

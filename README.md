@@ -110,11 +110,11 @@ Beware of NetworkManager, it can change your resolvers at will.
 
 1. Download repository public key and add it to your APT
 ```
-wget -qO - https://deb.revertron.com/key.txt | sudo apt-key add -
+wget -qO - https://deb.revertron.com/key.txt | gpg --dearmor - | sudo tee /usr/share/keyrings/alfis.gpg
 ```
 2. Add repository path to sources list
 ```
-echo 'deb https://deb.revertron.com/ debian alfis' | sudo tee /etc/apt/sources.list.d/alfis.list
+echo 'deb [signed-by=/usr/share/keyrings/alfis.gpg] https://deb.revertron.com/ debian alfis' | sudo tee /etc/apt/sources.list.d/alfis.list
 ```
 3. Update packages and install ALFIS
 ```
@@ -127,6 +127,23 @@ systemctl enable --now alfis
 After that configuration is in file `/etc/alfis.conf` and data is saved to `/var/lib/alfis`.
 If you have some DNS server bound to port 53, it will not properly start. Deal with it on your own.
 
+### openSUSE (without GUI)
+1. Add repo:
+```
+zypper ar --refresh obs://home:Werwolf2517 home:Werwolf2517
+```
+2. Refresh repos cache
+```
+zypper --gpg-auto-import-keys refresh
+```
+3. Install package
+```
+zypper install -y Alfis
+```
+4. Run daemon
+```
+systemctl enable --now alfis
+```
 ### Docker
 If you want to run ALFIS in docker container, you can do this by running:
 ```shell

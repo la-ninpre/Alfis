@@ -28,6 +28,8 @@ pub const BLOCK_SIGNERS_START_RANDOM: i64 = 90;
 pub const NEW_DOMAINS_INTERVAL: i64 = 86400; // One day in seconds
 pub const ONE_WEEK: i64 = 86400 * 7; // One week in seconds
 pub const DOMAIN_LIFETIME: i64 = 86400 * 365; // One year
+/// Time for the owner to remine his domain and not to loose it
+pub const DOMAIN_RENEW_TIME: i64 = 86400 * 30; // One month
 pub const MAX_RECORDS: usize = 30;
 pub const MAX_DATA_LEN: usize = 255;
 
@@ -35,6 +37,7 @@ pub const DB_NAME: &str = "blockchain.db";
 pub const CLASS_ORIGIN: &str = "origin";
 pub const CLASS_DOMAIN: &str = "domain";
 pub const ALFIS_DEBUG: &str = "ALFIS_DEBUG";
+pub const ALFIS_TRACE: &str = "ALFIS_TRACE";
 
 /// Public nodes listen port
 pub const LISTEN_PORT: u16 = 4244;

@@ -12,7 +12,7 @@ use sqlite::{Connection, State, Statement};
 use lazy_static::lazy_static;
 
 use crate::blockchain::hash_utils::*;
-use crate::blockchain::transaction::DomainData;
+use crate::blockchain::transaction::{DomainData, DomainState};
 use crate::blockchain::types::BlockQuality::*;
 use crate::blockchain::types::MineResult::*;
 use crate::blockchain::types::{BlockQuality, MineResult, Options, ZoneData};
@@ -35,8 +35,8 @@ const SQL_ADD_DOMAIN: &str = "INSERT INTO domains (id, timestamp, identity, conf
 const SQL_GET_BLOCK_BY_ID: &str = "SELECT * FROM blocks WHERE id=? LIMIT 1;";
 const SQL_GET_LAST_FULL_BLOCK: &str = "SELECT * FROM blocks WHERE id < ? AND `transaction`<>'' ORDER BY id DESC LIMIT 1;";
 const SQL_GET_LAST_FULL_BLOCK_FOR_KEY: &str = "SELECT * FROM blocks WHERE id < ? AND `transaction`<>'' AND pub_key = ? ORDER BY id DESC LIMIT 1;";
-const SQL_GET_DOMAIN_OWNER_BY_ID: &str = "SELECT signing FROM domains WHERE id < ? AND identity = ? ORDER BY id DESC LIMIT 1;";
-const SQL_GET_DOMAIN_BY_ID: &str = "SELECT * FROM domains WHERE identity = ? ORDER BY id DESC LIMIT 1;";
+const SQL_GET_DOMAIN_OWNER_BY_ID: &str = "SELECT signing, timestamp FROM domains WHERE id < ? AND identity = ? ORDER BY id DESC LIMIT 1;";
+const SQL_GET_DOMAIN_BY_ID: &str = "SELECT * FROM domains WHERE identity = ? AND id < ? ORDER BY id DESC LIMIT 1;";
 const SQL_GET_DOMAINS_BY_KEY: &str = "SELECT timestamp, identity, data, signing FROM domains WHERE signing = ? ORDER BY id;";
 const SQL_GET_DOMAINS_COUNT: &str = "SELECT count(DISTINCT identity) FROM domains;";
 const SQL_GET_USERS_COUNT: &str = "SELECT count(DISTINCT pub_key) FROM blocks;";
@@ -141,18 +141,15 @@ impl Chain {
                     if WRONG_HASHES.contains(&block.hash)  {
                         error!("Block {} has bad hash:\n{:?}", block.index, &block);
                         info!("Truncating database from block {}...", block.index);
-                        match self.truncate_db_from_block(block.index) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!("{}", e);
-                                panic!("Error truncating database! Please, delete 'blockchain.db' and restart.");
-                            }
+                        if let Err(e) = self.truncate_db_from_block(block.index) {
+                            error!("{}", e);
+                            panic!("Error truncating database! Please, delete 'blockchain.db' and restart.");
                         }
                         break;
                     }
 
                     //let last = self.last_block.clone().unwrap();
-                    if self.check_block(&block, &last_block, &last_full_block) != BlockQuality::Good {
+                    if self.check_block(&block, &last_block, &last_full_block) != Good {
                         error!("Block {} is bad:\n{:?}", block.index, &block);
                         info!("Truncating database from block {}...", block.index);
                         match self.truncate_db_from_block(block.index) {
@@ -391,10 +388,10 @@ impl Chain {
                 statement.bind(7, transaction.to_string().as_str())?;
             }
         }
-        statement.bind(8, &**block.prev_block_hash)?;
-        statement.bind(9, &**block.hash)?;
-        statement.bind(10, &**block.pub_key)?;
-        statement.bind(11, &**block.signature)?;
+        statement.bind(8, block.prev_block_hash.as_slice())?;
+        statement.bind(9, block.hash.as_slice())?;
+        statement.bind(10, block.pub_key.as_slice())?;
+        statement.bind(11, block.signature.as_slice())?;
         statement.next()
     }
 
@@ -409,11 +406,11 @@ impl Chain {
         let mut statement = self.db.prepare(sql)?;
         statement.bind(1, index as i64)?;
         statement.bind(2, timestamp)?;
-        statement.bind(3, &**t.identity)?;
-        statement.bind(4, &**t.confirmation)?;
+        statement.bind(3, t.identity.as_slice())?;
+        statement.bind(4, t.confirmation.as_slice())?;
         statement.bind(5, t.data.as_ref() as &str)?;
-        statement.bind(6, &**t.signing)?;
-        statement.bind(7, &**t.encryption)?;
+        statement.bind(6, t.signing.as_slice())?;
+        statement.bind(7, t.encryption.as_slice())?;
         statement.next()
     }
 
@@ -487,39 +484,62 @@ impl Chain {
         None
     }
 
-    /// Checks if any domain is available to mine for this client (pub_key)
-    pub fn is_domain_available(&self, height: u64, domain: &str, keystore: &Keystore) -> bool {
-        if domain.is_empty() {
-            return false;
+    pub fn can_mine_domain(&self, height: u64, domain: &str, pub_key: &Bytes) -> MineResult {
+        let name = domain.to_lowercase();
+        if !check_domain(&name, true) {
+            return WrongName;
         }
-        let identity_hash = hash_identity(domain, None);
-        if !self.is_id_available(height, &identity_hash, &keystore.get_public()) {
-            return false;
+        let zone = get_domain_zone(&name);
+        if !self.is_available_zone(&zone) {
+            return WrongZone;
         }
 
-        let parts: Vec<&str> = domain.rsplitn(2, '.').collect();
-        if parts.len() > 1 {
-            // We do not support third level domains
-            if parts.last().unwrap().contains('.') {
-                return false;
+        let (transaction, state) = self.get_domain_transaction_and_state(&name);
+        if let Some(transaction) = transaction {
+            let owner = transaction.signing.eq(pub_key);
+            match state {
+                DomainState::NotFound => {}
+                DomainState::Alive { .. } => if !owner {
+                    return NotOwned;
+                },
+                DomainState::Expired { .. } => if !owner {
+                    return NotOwned;
+                },
+                DomainState::Free { .. } => {}
             }
-            return self.is_available_zone(parts.first().unwrap());
         }
-        true
+        let identity_hash = hash_identity(&name, None);
+        self.can_mine_identity(&identity_hash, height, Utc::now().timestamp(), pub_key)
+    }
+
+    fn can_mine_identity(&self, identity_hash: &Bytes, height: u64, time: i64, pub_key: &Bytes) -> MineResult {
+        if let Some(last) = self.get_last_full_block(height, Some(pub_key)) {
+            // If this domain/identity is new
+            let want_new_domain = !self.is_domain_in_blockchain(height, &identity_hash);
+            // And the user hasn't mined a domain in previous 24h, then we allow her to mine
+            let time = last.timestamp + NEW_DOMAINS_INTERVAL - time;
+            if want_new_domain && time > 0 {
+                return Cooldown { time };
+            }
+        }
+        Fine
     }
 
     /// Checks if this identity is free or is owned by the same pub_key
-    pub fn is_id_available(&self, height: u64, identity: &Bytes, public_key: &Bytes) -> bool {
-        let mut statement = self.db.prepare(SQL_GET_DOMAIN_OWNER_BY_ID).unwrap();
-        statement.bind(1, height as i64).expect("Error in bind");
-        statement.bind(2, &***identity).expect("Error in bind");
-        while let State::Row = statement.next().unwrap() {
-            let pub_key = Bytes::from_bytes(&statement.read::<Vec<u8>>(0).unwrap());
-            if !pub_key.eq(public_key) {
-                return false;
-            }
+    pub fn is_id_available(&self, height: u64, time: i64, identity: &Bytes, public_key: &Bytes) -> bool {
+        let (transaction, state) = self.get_identity_transaction_and_state(identity, height, time);
+        if transaction.is_none() {
+            return true;
         }
-        true
+        if transaction.unwrap().signing.eq(public_key) {
+            return true;
+        }
+        match state {
+            DomainState::NotFound => true,
+            DomainState::Alive { .. } => false,
+            DomainState::Expired { .. } => false,
+            DomainState::Free { .. } => true
+        }
     }
 
     pub fn get_zones(&self) -> &Vec<ZoneData> {
@@ -557,7 +577,7 @@ impl Chain {
         // Checking for existing domain in DB
         let mut statement = self.db.prepare(SQL_GET_DOMAIN_OWNER_BY_ID).unwrap();
         statement.bind(1, height as i64).expect("Error in bind");
-        statement.bind(2, &***id).expect("Error in bind");
+        statement.bind(2, id.as_slice()).expect("Error in bind");
         if let State::Row = statement.next().unwrap() {
             // If there is such an ID
             return true;
@@ -565,39 +585,12 @@ impl Chain {
         false
     }
 
-    pub fn can_mine_domain(&self, height: u64, domain: &str, pub_key: &Bytes) -> MineResult {
-        let name = domain.to_lowercase();
-        if !check_domain(&name, true) {
-            return WrongName;
-        }
-        let zone = get_domain_zone(&name);
-        if !self.is_available_zone(&zone) {
-            return WrongZone;
-        }
-        if let Some(transaction) = self.get_domain_transaction(&name) {
-            if transaction.signing.ne(pub_key) {
-                return NotOwned;
-            }
-        }
-        let identity_hash = hash_identity(&name, None);
-        // TODO extract method
-        if let Some(last) = self.get_last_full_block(MAX, Some(pub_key)) {
-            let new_id = !self.is_domain_in_blockchain(height, &identity_hash);
-            let time = last.timestamp + NEW_DOMAINS_INTERVAL - Utc::now().timestamp();
-            if new_id && time > 0 {
-                return Cooldown { time };
-            }
-        }
-
-        Fine
-    }
-
-    pub fn get_domain_renewal_time(&self, identity_hash: &Bytes) -> Option<i64> {
+    pub fn get_domain_renewal_time(&self, time: i64, identity_hash: &Bytes) -> Option<i64> {
         let mut statement = self.db.prepare(SQL_GET_DOMAIN_UPDATE_TIME).unwrap();
         statement.bind(1, identity_hash.as_slice()).expect("Error in bind");
         if let State::Row = statement.next().unwrap() {
             let timestamp = statement.read::<i64>(0).unwrap();
-            if timestamp < Utc::now().timestamp() - DOMAIN_LIFETIME {
+            if timestamp < time - DOMAIN_LIFETIME {
                 // This domain is too old
                 return None;
             }
@@ -606,12 +599,13 @@ impl Chain {
         None
     }
 
-    pub fn get_domain_update_time(&self, identity_hash: &Bytes) -> Option<i64> {
+    pub fn get_domain_update_time(&self, identity_hash: &Bytes, height: u64, time: i64) -> Option<i64> {
         let mut statement = self.db.prepare(SQL_GET_DOMAIN_BY_ID).unwrap();
         statement.bind(1, identity_hash.as_slice()).expect("Error in bind");
+        statement.bind(2, height as i64 ).expect("Error in bind");
         if let State::Row = statement.next().unwrap() {
             let timestamp = statement.read::<i64>(1).unwrap();
-            if timestamp < Utc::now().timestamp() - DOMAIN_LIFETIME {
+            if timestamp < time - DOMAIN_LIFETIME {
                 // This domain is too old
                 return None;
             }
@@ -620,20 +614,20 @@ impl Chain {
         None
     }
 
-    pub fn get_domain_transaction_by_id(&self, identity_hash: &Bytes) -> Option<Transaction> {
-        if self.get_domain_renewal_time(identity_hash).is_none() {
-            // Domain has expired
-            return None;
-        }
-
+    pub fn get_identity_transaction_and_state(&self, identity_hash: &Bytes, height: u64, time: i64) -> (Option<Transaction>, DomainState) {
         let mut statement = self.db.prepare(SQL_GET_DOMAIN_BY_ID).unwrap();
         statement.bind(1, identity_hash.as_slice()).expect("Error in bind");
+        statement.bind(2, height as i64).expect("Error in bind");
         if let State::Row = statement.next().unwrap() {
             let timestamp = statement.read::<i64>(1).unwrap();
-            if timestamp < Utc::now().timestamp() - DOMAIN_LIFETIME {
-                // This domain is too old
-                return None;
-            }
+            // Determine current state of the domain
+            let state = if timestamp + DOMAIN_LIFETIME >= time {
+                DomainState::Alive { renewed_time: timestamp, until: timestamp + DOMAIN_LIFETIME }
+            } else if timestamp + DOMAIN_LIFETIME + DOMAIN_RENEW_TIME >= time {
+                DomainState::Expired { renewed_time: timestamp, until: timestamp + DOMAIN_LIFETIME + DOMAIN_RENEW_TIME }
+            } else {
+                DomainState::Free { renewed_time: timestamp }
+            };
             let identity = Bytes::from_bytes(&statement.read::<Vec<u8>>(2).unwrap());
             let confirmation = Bytes::from_bytes(&statement.read::<Vec<u8>>(3).unwrap());
             let class = String::from(CLASS_DOMAIN);
@@ -641,30 +635,37 @@ impl Chain {
             let signing = Bytes::from_bytes(&statement.read::<Vec<u8>>(5).unwrap());
             let encryption = Bytes::from_bytes(&statement.read::<Vec<u8>>(6).unwrap());
             let transaction = Transaction { identity, confirmation, class, data, signing, encryption };
-            return Some(transaction);
+            return (Some(transaction), state);
         }
-        None
+        (None, DomainState::NotFound)
     }
 
     /// Gets full Transaction info for any domain. Used by DNS part.
-    pub fn get_domain_transaction(&self, domain: &str) -> Option<Transaction> {
+    pub fn get_domain_transaction_and_state(&self, domain: &str) -> (Option<Transaction>, DomainState) {
         if domain.is_empty() {
-            return None;
+            return (None, DomainState::NotFound);
         }
         let identity_hash = hash_identity(domain, None);
-        if let Some(transaction) = self.get_domain_transaction_by_id(&identity_hash) {
+        let (transaction, state) = self.get_identity_transaction_and_state(&identity_hash, self.get_height(), Utc::now().timestamp());
+        if let Some(transaction) = transaction {
             debug!("Found transaction for domain {}: {:?}", domain, &transaction);
             if transaction.check_identity(domain) {
-                return Some(transaction);
+                return (Some(transaction), state);
             }
         }
-        None
+        (None, DomainState::NotFound)
     }
 
     pub fn get_domain_info(&self, domain: &str) -> Option<String> {
-        match self.get_domain_transaction(domain) {
-            None => None,
-            Some(transaction) => Some(transaction.data)
+        match self.get_domain_transaction_and_state(domain) {
+            (None, _) => None,
+            (Some(transaction), state) => {
+                if matches!(state, DomainState::Alive {..}) {
+                    Some(transaction.data)
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -703,7 +704,8 @@ impl Chain {
         let keystore = keystore.unwrap();
         let pub_key = keystore.get_public();
         let mut statement = self.db.prepare(SQL_GET_DOMAINS_BY_KEY).unwrap();
-        statement.bind(1, &**pub_key).expect("Error in bind");
+        statement.bind(1, pub_key.as_slice()).expect("Error in bind");
+        let height = self.get_height();
         while let State::Row = statement.next().unwrap() {
             let timestamp = statement.read::<i64>(0).unwrap();
             let identity = Bytes::from_bytes(&statement.read::<Vec<u8>>(1).unwrap());
@@ -711,7 +713,9 @@ impl Chain {
             let signing = Bytes::from_bytes(&statement.read::<Vec<u8>>(3).unwrap());
 
             // Get the last transaction for this id and check if it is still ours
-            if let Some(transaction) = self.get_domain_transaction_by_id(&identity) {
+            // TODO use state to show it in UI
+            let (transaction, _state) = self.get_identity_transaction_and_state(&identity, height, Utc::now().timestamp());
+            if let Some(transaction) = transaction {
                 if transaction.signing != signing {
                     trace!("Identity {:?} is not ours anymore, skipping", &identity);
                     continue;
@@ -726,7 +730,7 @@ impl Chain {
                     domain = String::from("unknown");
                 }
                 // TODO optimize
-                match self.get_domain_renewal_time(&identity) {
+                match self.get_domain_renewal_time(timestamp, &identity) {
                     None => result.insert(identity, (domain, timestamp, data)),
                     Some(t) => result.insert(identity, (domain, t, data))
                 };
@@ -802,13 +806,9 @@ impl Chain {
         }
         if let Some(last) = last_block {
             if block.index > last.index + 1 {
-                info!("Got future block {}", block.index);
+                debug!("Got future block {}", block.index);
                 return Future;
             }
-        }
-        if !check_public_key_strength(&block.pub_key, KEYSTORE_DIFFICULTY) {
-            warn!("Ignoring block with weak public key:\n{:?}", &block);
-            return Bad;
         }
         let difficulty = match &block.transaction {
             None => {
@@ -818,10 +818,10 @@ impl Chain {
                     SIGNER_DIFFICULTY
                 }
             }
-            Some(t) => self.get_difficulty_for_transaction(t)
+            Some(t) => self.get_difficulty_for_transaction(t, block.index, block.timestamp)
         };
         if block.difficulty < difficulty {
-            warn!("Block difficulty is lower than needed");
+            warn!("Block difficulty is lower than needed: {} < {}", block.difficulty, difficulty);
             return Bad;
         }
         if hash_difficulty(&block.hash) < block.difficulty {
@@ -850,23 +850,18 @@ impl Chain {
         }
 
         if let Some(transaction) = &block.transaction {
-            let current_height = match last_block {
-                None => 0,
-                Some(block) => block.index
-            };
+            if !check_public_key_strength(&block.pub_key, KEYSTORE_DIFFICULTY) {
+                warn!("Ignoring block with weak public key:\n{:?}", &block);
+                return Bad;
+            }
             // If this domain is not available to this public key
-            if !self.is_id_available(current_height, &transaction.identity, &block.pub_key) {
+            if !self.is_id_available(block.index - 1, timestamp, &transaction.identity, &block.pub_key) {
                 warn!("Block {:?} is trying to spoof an identity!", &block);
                 return Bad;
             }
-            if let Some(last) = self.get_last_full_block(block.index, Some(&block.pub_key)) {
-                if last.index < block.index {
-                    let new_id = !self.is_domain_in_blockchain(block.index, &transaction.identity);
-                    if new_id && last.timestamp + NEW_DOMAINS_INTERVAL > block.timestamp {
-                        warn!("Block {:?} is mined too early!", &block);
-                        return Bad;
-                    }
-                }
+            if self.can_mine_identity(&transaction.identity, block.index, block.timestamp, &block.pub_key) != Fine {
+                warn!("Block {:?} is mined too early!", &block);
+                return Bad;
             }
             // Check if yggdrasil only property of zone is not violated
             if let Some(block_data) = transaction.get_domain_data() {
@@ -987,11 +982,11 @@ impl Chain {
         true
     }
 
-    fn get_difficulty_for_transaction(&self, transaction: &Transaction) -> u32 {
+    fn get_difficulty_for_transaction(&self, transaction: &Transaction, height: u64, time: i64) -> u32 {
         match transaction.class.as_ref() {
             CLASS_DOMAIN => {
                 // If this domain is already in blockchain we approve slightly smaller difficulty
-                let discount = self.get_identity_discount(&transaction.identity, false);
+                let discount = self.get_identity_discount(&transaction.identity, false, height, time);
                 // TODO move this check somewhere appropriate
                 return match serde_json::from_str::<DomainData>(&transaction.data) {
                     Ok(_) => DOMAIN_DIFFICULTY - discount,
@@ -1006,8 +1001,8 @@ impl Chain {
         }
     }
 
-    pub fn get_identity_discount(&self, identity: &Bytes, renewal: bool) -> u32 {
-        match self.get_domain_update_time(identity) {
+    pub fn get_identity_discount(&self, identity: &Bytes, renewal: bool, height: u64, time: i64) -> u32 {
+        match self.get_domain_update_time(identity, height, time) {
             None => 0u32,
             Some(timestamp) => {
                 if renewal || self.get_height() < BLOCKS_WITHOUT_DISCOUNT {
@@ -1015,7 +1010,7 @@ impl Chain {
                 }
                 // Weeks since this domain was changed + 1, but not more than 7 weeks.
                 // So max discount will be 8 bits of difficulty.
-                (min((Utc::now().timestamp() - timestamp) / ONE_WEEK, 7i64) + 1) as u32
+                (min((time - timestamp) / ONE_WEEK, 7i64) + 1) as u32
             }
         }
     }
@@ -1039,9 +1034,11 @@ impl Chain {
         }
 
         let mut set = HashSet::new();
-        let tail = block.signature.get_tail_u64();
+        let mut tail = block.signature.get_tail_u64();
         let mut count = 1;
+        let mut mitigated = false;
         let window = block.index - 1; // Without the last block
+        trace!("Calculating signers, tail: {}, window: {}", tail, window);
         while set.len() < BLOCK_SIGNERS_ALL as usize {
             let index = (tail.wrapping_mul(count) % window) + 1; // We want it to start from 1
             if let Some(b) = self.get_block(index) {
@@ -1057,8 +1054,12 @@ impl Chain {
                 }
             }
             count += 1;
+            if !mitigated && count > 5000 {
+                tail = tail / 13;
+                mitigated = true;
+            }
         }
-        trace!("Got signers for block {}: {:?}", block.index, &result);
+        debug!("Got signers for block {}: {:?}, loop count {}", block.index, &result, count);
         let mut signers = self.signers.borrow_mut();
         signers.index = block.index;
         signers.signers = result.clone();
@@ -1107,7 +1108,7 @@ pub mod tests {
     use log::LevelFilter;
     #[allow(unused_imports)]
     use log::{debug, error, info, trace, warn};
-    use simplelog::{ColorChoice, ConfigBuilder, TermLogger, TerminalMode};
+    use simplelog::{ColorChoice, ConfigBuilder, TermLogger, TerminalMode, LevelPadding, format_description};
 
     use crate::{Block, Chain, Settings};
 
@@ -1117,8 +1118,9 @@ pub mod tests {
             .set_thread_level(LevelFilter::Off)
             .set_location_level(LevelFilter::Off)
             .set_target_level(LevelFilter::Error)
+            .set_level_padding(LevelPadding::Right)
             .set_time_level(LevelFilter::Error)
-            .set_time_to_local(true)
+            .set_time_format_custom(format_description!("[hour]:[minute]:[second].[subsecond digits:3]"))
             .build();
         if let Err(e) = TermLogger::init(LevelFilter::Trace, config, TerminalMode::Stdout, ColorChoice::Auto) {
             println!("Unable to initialize logger!\n{}", e);

@@ -17,7 +17,7 @@ use alfis::event::Event;
 use alfis::eventbus::{post, register};
 use alfis::miner::Miner;
 use alfis::{keystore, Block, Bytes, Context, Keystore, Transaction};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn, LevelFilter};
 use serde::{Deserialize, Serialize};
@@ -126,7 +126,10 @@ fn action_check_domain(context: &Arc<Mutex<Context>>, web_view: &mut WebView<()>
     let c = context.lock().unwrap();
     if let Some(keystore) = c.get_keystore() {
         let name = name.to_lowercase();
-        let available = c.get_chain().is_domain_available(c.get_chain().get_height(), &name, keystore);
+        let available = match c.chain.can_mine_domain(c.chain.get_height(), &name, &keystore.get_public()) {
+            MineResult::Fine => true,
+            _ => false
+        };
         web_view.eval(&format!("domainAvailable({})", available)).expect("Error evaluating!");
     }
 }
@@ -360,7 +363,7 @@ fn load_domains(context: &mut MutexGuard<Context>, handle: &Handle<()>) {
     //debug!("Domains: {:?}", &domains.values());
     for (_identity, (domain, timestamp, data)) in domains {
         let d = serde_json::to_string(&data).unwrap();
-        let d = d.replace("'", "\\'");
+        let d = d.replace("'", "\\'").replace("\\n", "\\\\n");
         let command = format!("addMyDomain('{}', {}, {}, '{}');", &domain, timestamp, timestamp + DOMAIN_LIFETIME, &d);
         let _ = handle.dispatch(move |web_view|{
             web_view.eval(&command)
@@ -442,7 +445,7 @@ fn action_create_domain(context: Arc<Mutex<Context>>, miner: Arc<Mutex<Miner>>, 
     };
     match context.chain.can_mine_domain(context.chain.get_height(), &name, &pub_key) {
         MineResult::Fine => {
-            std::mem::drop(context);
+            drop(context);
             create_domain(c, miner, CLASS_DOMAIN, &name, data, DOMAIN_DIFFICULTY, &keystore, signing, encryption, renewal);
             let _ = web_view.eval("domainMiningStarted();");
             event_info(web_view, &format!("Mining of domain \\'{}\\' has started", &name));
@@ -574,7 +577,8 @@ fn create_domain(context: Arc<Mutex<Context>>, miner: Arc<Mutex<Miner>>, class: 
     };
     let transaction = Transaction::from_str(name, class.to_owned(), data, signing, encryption);
     // If this domain is already in blockchain we approve slightly smaller difficulty
-    let discount = context.lock().unwrap().chain.get_identity_discount(&transaction.identity, renewal);
+    let height = context.lock().unwrap().chain.get_height();
+    let discount = context.lock().unwrap().chain.get_identity_discount(&transaction.identity, renewal, height, Utc::now().timestamp());
     let block = Block::new(Some(transaction), keystore.get_public(), Bytes::default(), difficulty - discount);
     miner.lock().unwrap().add_block(block, keystore.clone());
 }
